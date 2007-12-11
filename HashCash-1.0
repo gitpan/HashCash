@@ -1,0 +1,150 @@
+=head1 NAME
+ 
+HashCash Version 1.0 / Dec.2007 / Marc Sebastian Pelzer / http://search.cpan.org/~mpelzer/
+ 
+=head1 DESCRIPTION
+ 
+HashCash adds a X-HashCash header for each recipient of an outgoing email. This header is supported
+by SpamAssasin and other Spam-Filters. The generation of a HashCash is expensive - it takes some CPU
+cycles to calculate the hash. Spam senders normally send millions of mails per day and it's not
+possible (or at least quite expensive) for them to calculate this HashCash. On the other hand, for a
+mailserver like yours, with normal daily business, it should be no problem to do the job for each
+outgoing mail.
+ 
+See
+ 
+http://www.hashcash.org
+http://www.hashcash.org/faq/
+ 
+for more information about the HashCash mechanism
+ 
+=head1 INSTALLATION
+ 
+Copy this plug-in into your qpsmtpd's plugin directory and put a line like this into your config/plugins:
+ 
+HashCash 10 5
+ 
+This plug-in is being called with two (optional) parameters. The first one as a time in seconds that
+the generation of a HashCah should take a maximum. The second parameter is a time in seconds that the
+generation should take a minimum. So, for example if you specify "10 5" like in the example above, the
+generation of one HashCah per recipient will take between 5 and 10 seconds. Please be aware, that it
+can take a long time to create HashCah headers if you send an email to multiple recipients!
+ 
+If you dont specify those two numbers, a default of "5 3" will be used.
+ 
+Two Perl Modules are needed in order to run this plug-in:
+ 
+Digest::Hashcash
+Time::HiRes
+ 
+Get them via "perl -MCPAN -e shell" if you dont have them.
+ 
+Important:
+ 
+This plug-in is being called for all emails - wether they're incoming mails or outgoing mails.
+Normally your qpsmtpd is listening on an external interface, tcp port 25 and handles mails that
+should be locally delivered and also mail that should be routed to the outside world through
+your running MTA. A HashCash should only be added to mails that are being sent from one of your
+realay-clients to the outside world! Otherwise we're goning to calulate the stuff also for all
+incoming mails, which doesnt make too much sense.
+ 
+At this time there is no standard flag or note in qpsmtpd that marks a mail as "incoming" or
+"outgoing". So you need to do this by your-self, by adding a line like this:
+ 
+$self->qp->connection->notes('is_outgoing_mail', 1);
+ 
+to one of the other qpsmtpd modules, like "check_rcptto_exists" or "check_qmail_deliverable"
+or any other module that checks if the remote peer is a valid RELAY client or not. Only if this
+"note" is set, this hook will be activated when it's being called by qpsmtpd. So make sure,
+that you set it somewhere where it makes sense.
+ 
+Example "patch" for the "check_rcptto_exists" plug-in:
+ 
+--- 8< ---------------------------------------------------------------------------------
+ 
+  my @relayclients = $self->qp->config("relayclients");
+ 
+  foreach $tmp (@relayclients) {
+ 
+    if ($remote_host =~ m!$tmp! || $remote_ip =~ m!$tmp!) {
+ 
+        $self->log(LOGNOTICE, "Ok - remote peer is a allowed RELAY client ($remote_host / $remote_ip)");
+ 
+        $self->qp->connection->notes('is_outgoing_mail', 1);		# <========= add this line
+ 
+        return DECLINED;
+    }
+  }
+ 
+--- 8< ---------------------------------------------------------------------------------
+ 
+Also, 
+ 
+$self->qp ->connection->relay_client()
+ 
+is being check for a TRUE value. This is the case, when the user has been authenticated against
+qpsmtpd via SMTP AUTH.
+ 
+ 
+=cut
+ 
+use Digest::Hashcash;
+use Time::HiRes qw ( gettimeofday tv_interval );
+ 
+sub register {
+ 
+	my ($self, $qp, @args) = @_;
+ 
+	unless ($args[0] && $args[1]) {
+ 
+		$self->log(LOGWARN, "Called with no parameters. Using DEFAULT values instead.");
+ 
+		$self->{_max} = 5;
+		$self->{_min} = 3;
+ 
+	} else {
+ 
+		$self->log(LOGNOTICE, "Setting max/min values to $args[0]/$args[1]");
+ 
+		$self->{_max} = $args[0];
+		$self->{_min} = $args[1];
+	}
+}
+ 
+sub hook_data_post {
+ 
+	my ($self, $transaction) = @_;
+	my ($size, $cipher, $token, $recipient, @recipients, $start_time);
+ 
+	if ($self->qp->connection->relay_client || $self->qp->connection->notes('is_outgoing_mail')) {
+ 
+		$self->log(LOGNOTICE, "This is a outgoing mail - we create a HashCash for this mail!");
+ 
+		Digest::Hashcash::estimate_time(1);		# work-around for bug in Digest::Hashcash
+ 
+		$size = Digest::Hashcash::estimate_size($self->{_max}, $self->{_min});
+ 
+		@recipients = map { $_->address } $transaction->recipients;
+ 
+		foreach $recipient (@recipients) {
+ 
+			$start_time = [gettimeofday];
+ 
+			$cipher = new Digest::Hashcash(size => $size, uid => $recipient);
+ 
+			$token = $cipher->hash();
+ 
+			$self->log(LOGNOTICE, "Calculated a HashCash for recipient '$recipient' in " . tv_interval($start_time, [gettimeofday]) . " seconds.");
+ 
+			# add one X-Hashcash header per recipient - as described in http://www.hashcash.org/faq/
+			#
+			$transaction->header->add("X-Hashcash", $token);
+		}
+ 
+	} else {
+ 
+		$self->log(LOGDEBUG, "This mail is NOT marked as outgoing mail. Nothing to do for us.");
+	}
+ 
+	return DECLINED;
+}
